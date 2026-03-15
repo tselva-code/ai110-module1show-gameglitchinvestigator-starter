@@ -32,6 +32,8 @@ When I first ran Game Glitch Investigator, the interface looked like a standard 
   **Defect 8:** Inaccurate Developer Debug History
   * Expected: The debug window should show a correct chronological history of the guesses and the secret number.
   * Actual: The debug history is inaccurate and does not sync with the current game session.
+  (for example: "the hints were backwards").
+
 ---
 
 ## 2. How did you use AI as a teammate?
@@ -75,6 +77,7 @@ When I first ran Game Glitch Investigator, the interface looked like a standard 
 - What change did you make that finally gave the game a stable secret number?
   To keep the secret number from changing, I used Session State to store it.
   I updated the code to check if a secret number already existed in the session before creating a new one. By wrapping the random number generator in a simple if 'secret_number' not in st.session_state: block, I ensured the app would only pick a number once. Now, when the script reruns, it just pulls the same value from memory instead of generating a new one.
+- How would you explain Streamlit "reruns" and session state to a friend who has never used Streamlit?
 
 ---
 
