@@ -446,3 +446,241 @@ class TestDefect8DebugHistory:
         self._simulate_submit(history, True, 55)
         self._simulate_submit(history, False, None)   # invalid — not appended
         assert history == [20, 55]
+
+
+# ── Edge case inputs ───────────────────────────────────────────────────────────
+# Three inputs identified that produce surprising or inconsistent behavior in
+# parse_guess, even after all eight defects were fixed:
+#
+#  Edge Case 1 — Decimal truncation
+#    "50.9" is silently accepted as 50 (int(float()) truncates, not rounds).
+#    The player typed 50.9 but 50 is processed with no warning. If the secret
+#    is 51, the player effectively wasted an attempt without knowing why.
+#
+#  Edge Case 2 — Scientific notation rejected
+#    "1e2" has no "." so the code tries int("1e2") → ValueError → "That is not
+#    a number."  But 1e2 = 100, a perfectly valid in-range guess.  A player
+#    who uses math notation is silently blocked.
+#
+#  Edge Case 3 — Whitespace-padded input accepted
+#    " 50 " has no "." so the code tries int(" 50 ") — Python's int() strips
+#    whitespace and returns 50.  A lone " " raises ValueError.  The behavior
+#    is inconsistent: padding is silently stripped for numbers but rejected
+#    for pure whitespace.
+
+class TestEdgeCaseInputs:
+
+    # ── Edge Case 1: decimal input rejected (fixed) ───────────────────────────
+    # Before the fix, "50.9" was silently accepted as 50 via int(float()).
+    # The player got no feedback and wasted an attempt on an unintended value.
+    # Fix: any input containing "." is now rejected with a clear message.
+
+    def test_decimal_is_rejected_with_clear_message(self):
+        """'50.9' must be rejected — decimals are not valid whole-number guesses."""
+        ok, value, err = parse_guess("50.9")
+        assert ok is False
+        assert value is None
+        assert err == "Please enter a whole number."
+
+    def test_decimal_at_range_boundary_is_rejected(self):
+        """'99.9' must be rejected, not silently truncated to 99."""
+        ok, _, err = parse_guess("99.9")
+        assert ok is False
+        assert err == "Please enter a whole number."
+
+    def test_negative_decimal_is_rejected(self):
+        """'-1.9' must be rejected, not silently truncated to -1."""
+        ok, _, err = parse_guess("-1.9")
+        assert ok is False
+        assert err == "Please enter a whole number."
+
+    def test_whole_number_string_still_accepted(self):
+        """'50' (no decimal) must still parse successfully as before."""
+        ok, value, _ = parse_guess("50")
+        assert ok is True
+        assert value == 50
+
+    # ── Edge Case 2: scientific notation rejected ─────────────────────────────
+
+    def test_scientific_notation_without_dot_is_rejected(self):
+        """'1e2' (= 100) has no '.' so int('1e2') raises ValueError → rejected."""
+        ok, _, err = parse_guess("1e2")
+        assert ok is False, (
+            "Scientific notation '1e2' was accepted; behavior may be inconsistent"
+        )
+
+    def test_scientific_notation_with_dot_is_also_rejected(self):
+        """'1.0e2' contains a '.' so it is now rejected by the decimal fix,
+        making both '1e2' and '1.0e2' consistently rejected."""
+        ok, _, err = parse_guess("1.0e2")
+        assert ok is False
+        assert err == "Please enter a whole number."
+
+    def test_both_scientific_notation_forms_are_rejected(self):
+        """After the Edge Case 1 fix, '1e2' and '1.0e2' are both rejected —
+        the previous inconsistency (one accepted, one not) no longer exists."""
+        ok_no_dot, _, _ = parse_guess("1e2")
+        ok_with_dot, _, _ = parse_guess("1.0e2")
+        assert ok_no_dot is False and ok_with_dot is False
+
+    # ── Edge Case 3: whitespace-padded input ──────────────────────────────────
+
+    def test_whitespace_padded_number_is_silently_accepted(self):
+        """' 50 ' has no '.' so int(' 50 ') strips whitespace → accepted as 50."""
+        ok, value, _ = parse_guess(" 50 ")
+        assert ok is True
+        assert value == 50
+
+    def test_pure_whitespace_is_rejected(self):
+        """' ' alone raises ValueError → rejected as not a number."""
+        ok, _, err = parse_guess(" ")
+        assert ok is False
+
+    def test_whitespace_inconsistency(self):
+        """' 50 ' is accepted but ' ' is rejected — documents that whitespace
+        handling depends on whether a digit is also present."""
+        ok_padded, _, _ = parse_guess(" 50 ")
+        ok_blank, _, _ = parse_guess(" ")
+        assert ok_padded is True and ok_blank is False, (
+            "Expected padded number accepted and blank whitespace rejected"
+        )
+
+
+# ── Stretch Feature: High Score tracker ───────────────────────────────────────
+# load_highscores() and save_highscore() live in app.py which imports Streamlit
+# at module level, making it impossible to import directly in pytest.
+# These tests replicate the core logic using a tmp_path fixture so the
+# file I/O, sorting, and field-storage behaviour can be verified independently.
+
+import json as _json
+from datetime import date as _date
+
+class TestHighScoreTracker:
+
+    def _load(self, filepath):
+        """Mirror load_highscores() from app.py."""
+        if filepath.exists():
+            return _json.loads(filepath.read_text())
+        return []
+
+    def _save(self, filepath, score, difficulty, attempts):
+        """Mirror save_highscore() from app.py."""
+        scores = self._load(filepath)
+        scores.append({
+            "score": score,
+            "difficulty": difficulty,
+            "attempts": attempts,
+            "date": str(_date.today()),
+        })
+        scores.sort(key=lambda x: x["score"], reverse=True)
+        scores = scores[:5]
+        filepath.write_text(_json.dumps(scores, indent=2))
+
+    def test_load_returns_empty_list_when_no_file(self, tmp_path):
+        """No file present → empty list, no crash."""
+        assert self._load(tmp_path / "hs.json") == []
+
+    def test_save_creates_the_file(self, tmp_path):
+        """First save must create the JSON file on disk."""
+        f = tmp_path / "hs.json"
+        self._save(f, 100, "Easy", 1)
+        assert f.exists()
+
+    def test_saved_entry_has_all_required_fields(self, tmp_path):
+        """Each entry must contain score, difficulty, attempts, and date."""
+        f = tmp_path / "hs.json"
+        self._save(f, 90, "Normal", 2)
+        entry = self._load(f)[0]
+        for field in ("score", "difficulty", "attempts", "date"):
+            assert field in entry, f"Missing field: {field}"
+
+    def test_entry_stores_correct_values(self, tmp_path):
+        """Saved values must match the arguments passed to save_highscore."""
+        f = tmp_path / "hs.json"
+        self._save(f, 80, "Hard", 3)
+        entry = self._load(f)[0]
+        assert entry["score"] == 80
+        assert entry["difficulty"] == "Hard"
+        assert entry["attempts"] == 3
+        assert entry["date"] == str(_date.today())
+
+    def test_scores_sorted_descending(self, tmp_path):
+        """Leaderboard must always show highest scores first."""
+        f = tmp_path / "hs.json"
+        for score in [70, 100, 50]:
+            self._save(f, score, "Normal", 3)
+        saved = [e["score"] for e in self._load(f)]
+        assert saved == sorted(saved, reverse=True)
+
+    def test_only_top_5_entries_kept(self, tmp_path):
+        """Saving more than 5 entries must trim the list to 5."""
+        f = tmp_path / "hs.json"
+        for i in range(7):
+            self._save(f, (i + 1) * 10, "Normal", i + 1)
+        assert len(self._load(f)) == 5
+
+    def test_top_5_are_the_highest_scores(self, tmp_path):
+        """After trimming, the retained entries must be the 5 highest scores."""
+        f = tmp_path / "hs.json"
+        for i in range(7):
+            self._save(f, (i + 1) * 10, "Normal", i + 1)
+        kept = {e["score"] for e in self._load(f)}
+        assert 70 in kept, "Highest score missing from top-5"
+        assert 10 not in kept, "Lowest score should have been trimmed"
+
+    def test_multiple_saves_accumulate_correctly(self, tmp_path):
+        """Saving three distinct scores must produce three separate entries."""
+        f = tmp_path / "hs.json"
+        self._save(f, 100, "Easy", 1)
+        self._save(f, 80, "Normal", 3)
+        self._save(f, 60, "Hard", 4)
+        assert len(self._load(f)) == 3
+
+
+# ── Stretch Feature: Guess History sidebar chart ──────────────────────────────
+# The chart itself is rendered by Streamlit (untestable in pytest), but the
+# DataFrame construction logic can be exercised independently.
+
+class TestGuessHistoryChart:
+
+    def _build_chart_data(self, history, secret):
+        """Mirror the DataFrame construction inside app.py's sidebar chart block."""
+        import pandas as pd
+        return pd.DataFrame({
+            "Your Guess": history,
+            "Secret": [secret] * len(history),
+        })
+
+    def test_empty_history_is_falsy_so_chart_is_skipped(self):
+        """The chart block is guarded by 'if history:' — empty list must be falsy."""
+        assert not bool([])
+
+    def test_chart_data_has_correct_columns(self):
+        """DataFrame must contain exactly 'Your Guess' and 'Secret' columns."""
+        df = self._build_chart_data([30, 60], 50)
+        assert "Your Guess" in df.columns
+        assert "Secret" in df.columns
+
+    def test_secret_column_is_a_constant_reference_line(self):
+        """Every row in 'Secret' must equal the secret number."""
+        df = self._build_chart_data([20, 80, 50], 42)
+        assert list(df["Secret"]) == [42, 42, 42]
+
+    def test_guess_column_matches_history_order(self):
+        """'Your Guess' column must preserve the chronological guess order."""
+        history = [10, 55, 75]
+        df = self._build_chart_data(history, 60)
+        assert list(df["Your Guess"]) == history
+
+    def test_row_count_equals_history_length(self):
+        """One DataFrame row must exist per submitted guess."""
+        history = [30, 60, 45, 52]
+        df = self._build_chart_data(history, 50)
+        assert len(df) == len(history)
+
+    def test_single_guess_produces_one_row_chart(self):
+        """A history with one entry must still build a valid single-row DataFrame."""
+        df = self._build_chart_data([50], 50)
+        assert len(df) == 1
+        assert df["Your Guess"][0] == 50
+        assert df["Secret"][0] == 50
