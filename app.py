@@ -1,68 +1,6 @@
 import random
 import streamlit as st
-
-def get_range_for_difficulty(difficulty: str):
-    if difficulty == "Easy":
-        return 1, 20
-    if difficulty == "Normal":
-        return 1, 100
-    if difficulty == "Hard":
-        return 1, 50
-    return 1, 100
-
-
-def parse_guess(raw: str):
-    if raw is None:
-        return False, None, "Enter a guess."
-
-    if raw == "":
-        return False, None, "Enter a guess."
-
-    try:
-        if "." in raw:
-            value = int(float(raw))
-        else:
-            value = int(raw)
-    except Exception:
-        return False, None, "That is not a number."
-
-    return True, value, None
-
-
-def check_guess(guess, secret):
-    if guess == secret:
-        return "Win", "🎉 Correct!"
-
-    try:
-        if guess > secret:
-            return "Too High", "📈 Go HIGHER!"
-        else:
-            return "Too Low", "📉 Go LOWER!"
-    except TypeError:
-        g = str(guess)
-        if g == secret:
-            return "Win", "🎉 Correct!"
-        if g > secret:
-            return "Too High", "📈 Go HIGHER!"
-        return "Too Low", "📉 Go LOWER!"
-
-
-def update_score(current_score: int, outcome: str, attempt_number: int):
-    if outcome == "Win":
-        points = 100 - 10 * (attempt_number + 1)
-        if points < 10:
-            points = 10
-        return current_score + points
-
-    if outcome == "Too High":
-        if attempt_number % 2 == 0:
-            return current_score + 5
-        return current_score - 5
-
-    if outcome == "Too Low":
-        return current_score - 5
-
-    return current_score
+from logic_utils import get_range_for_difficulty, parse_guess, check_guess, update_score
 
 st.set_page_config(page_title="Glitchy Guesser", page_icon="🎮")
 
@@ -77,11 +15,19 @@ difficulty = st.sidebar.selectbox(
     index=1,
 )
 
+# Defect 4 Fix Start: The original map had Easy=6, Normal=8, Hard=5 —
+# Normal was more forgiving than Easy, inverting the expected difficulty curve.
+# We spotted this by switching difficulties in the sidebar and comparing the
+# displayed attempt counts. Described the inversion to AI, which confirmed the
+# expected ordering (Easy = most attempts, Hard = fewest) and suggested the
+# corrected values below so each tier is meaningfully distinct.
 attempt_limit_map = {
-    "Easy": 6,
-    "Normal": 8,
+    "Easy": 10,
+    "Normal": 7,
     "Hard": 5,
 }
+# Defect 4 Fix End: Easy=10, Normal=7, Hard=5 — attempt counts now decrease
+# correctly as difficulty increases, verified by checking sidebar captions.
 attempt_limit = attempt_limit_map[difficulty]
 
 low, high = get_range_for_difficulty(difficulty)
@@ -92,8 +38,19 @@ st.sidebar.caption(f"Attempts allowed: {attempt_limit}")
 if "secret" not in st.session_state:
     st.session_state.secret = random.randint(low, high)
 
+# Defect 3 Fix Start: attempts was initialized to 1, so the counter started at
+# N-1 before any guess was made, and the display lagged one run behind because
+# st.info() renders before the submit block increments the value.
+# We traced both causes by reading session_state in the debug panel and asking
+# AI to walk through Streamlit's top-to-bottom execution model. AI showed that
+# on the run triggered by a button click, the counter line executes before the
+# increment line — so the display always reflects the previous run's value.
+# Fix: initialize to 0 and use st.empty() placeholder filled after the submit
+# block so the counter always reflects the post-increment value.
 if "attempts" not in st.session_state:
-    st.session_state.attempts = 1
+    st.session_state.attempts = 0
+# Defect 3 Fix End: attempts starts at 0; counter_placeholder below is filled
+# after the submit block so it always reflects the post-increment value.
 
 if "score" not in st.session_state:
     st.session_state.score = 0
@@ -106,36 +63,44 @@ if "history" not in st.session_state:
 
 st.subheader("Make a guess")
 
-st.info(
-    f"Guess a number between 1 and 100. "
-    f"Attempts left: {attempt_limit - st.session_state.attempts}"
-)
+counter_placeholder = st.empty()
 
-with st.expander("Developer Debug Info"):
-    st.write("Secret:", st.session_state.secret)
-    st.write("Attempts:", st.session_state.attempts)
-    st.write("Score:", st.session_state.score)
-    st.write("Difficulty:", difficulty)
-    st.write("History:", st.session_state.history)
 
-raw_guess = st.text_input(
-    "Enter your guess:",
-    key=f"guess_input_{difficulty}"
-)
+# Defect 6 Fix Start: st.text_input + st.button do not share a form, so
+# pressing Enter in the input field did nothing — the player had to click
+# the button manually. We confirmed this by reading Streamlit docs and asking
+# AI which widget enables Enter-to-submit; AI pointed to st.form +
+# st.form_submit_button as the correct pattern. Wrapping the input and submit
+# button inside st.form ties Enter key presses to form submission automatically.
+with st.form("guess_form"):
+    raw_guess = st.text_input(
+        "Enter your guess:",
+        key=f"guess_input_{difficulty}"
+    )
+    submit = st.form_submit_button("Submit Guess 🚀")
+# Defect 6 Fix End
 
-col1, col2, col3 = st.columns(3)
+col1, col2 = st.columns(2)
 with col1:
-    submit = st.button("Submit Guess 🚀")
-with col2:
     new_game = st.button("New Game 🔁")
-with col3:
+with col2:
     show_hint = st.checkbox("Show hint", value=True)
 
+# Defect 2 Fix Start: The New Game button reset attempts and secret but forgot
+# to clear status and score. Because the st.stop() guard checks status
+# immediately on rerun, the game stayed stuck in "won"/"lost" and was
+# unplayable after the first round. We traced the freeze to the missing resets
+# by reading the session_state in the debug panel, then asked AI to review the
+# new_game block. AI identified the two missing lines; we verified by winning a
+# game and confirming a fresh round started correctly after clicking New Game.
 if new_game:
     st.session_state.attempts = 0
     st.session_state.secret = random.randint(1, 100)
+    st.session_state.status = "playing"
+    st.session_state.score = 0
     st.success("New game started.")
     st.rerun()
+# Defect 2 Fix End
 
 if st.session_state.status != "playing":
     if st.session_state.status == "won":
@@ -149,16 +114,33 @@ if submit:
 
     ok, guess_int, err = parse_guess(raw_guess)
 
+    # Defect 7 Fix Start: parse_guess only checked that the input was a valid
+    # number; it never checked whether the value fell within the game's range.
+    # Numbers like -5 or 500 were accepted and processed as normal guesses.
+    # We spotted this by typing 0 and 999 and watching them sail through.
+    # AI confirmed that parse_guess has no knowledge of the range and suggested
+    # adding the bounds check here in app.py right after parsing, since low/high
+    # are already in scope and parse_guess stays a general-purpose utility.
+    if ok and not (low <= guess_int <= high):
+        ok = False
+        err = f"Please enter a number between {low} and {high}."
+    # Defect 7 Fix End
+
     if not ok:
-        st.session_state.history.append(raw_guess)
         st.error(err)
     else:
         st.session_state.history.append(guess_int)
 
-        if st.session_state.attempts % 2 == 0:
-            secret = str(st.session_state.secret)
-        else:
-            secret = st.session_state.secret
+        # Defect 1 - Issue 2 Fix Start: The original code cast secret to str on
+        # even attempts and kept it as int on odd ones (attempt_number % 2 == 0).
+        # In Python 3, comparing int > str raises TypeError, so check_guess fell
+        # into its except block and did string comparison — making hints flip
+        # randomly for the same guess. We spotted the toggle by re-submitting
+        # the same number twice and watching the hint change. AI explained why
+        # int/str comparison is undefined in Python 3; the fix is to always pass
+        # the raw int directly from session_state without any type conversion.
+        secret = st.session_state.secret
+        # Defect 1 - Issue 2 Fix End
 
         outcome, message = check_guess(guess_int, secret)
 
@@ -186,6 +168,26 @@ if submit:
                     f"The secret was {st.session_state.secret}. "
                     f"Score: {st.session_state.score}"
                 )
+
+counter_placeholder.info(
+    f"Guess a number between 1 and 100. "
+    f"Attempts left: {attempt_limit - st.session_state.attempts}"
+)
+
+# Defect 8 Fix Start: the debug expander was placed above the submit block, so
+# it rendered with stale session_state values from the start of the current run.
+# History, attempts, and score were all one step behind after every submission.
+# We caught this by submitting a guess and comparing the debug panel to the
+# actual game state. AI explained Streamlit's top-to-bottom render order and
+# suggested moving the expander to after all state mutations so it always
+# reflects the final values for the current run.
+with st.expander("Developer Debug Info"):
+    st.write("Secret:", st.session_state.secret)
+    st.write("Attempts:", st.session_state.attempts)
+    st.write("Score:", st.session_state.score)
+    st.write("Difficulty:", difficulty)
+    st.write("History:", st.session_state.history)
+# Defect 8 Fix End
 
 st.divider()
 st.caption("Built by an AI that claims this code is production-ready.")

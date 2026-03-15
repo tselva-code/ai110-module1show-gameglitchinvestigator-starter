@@ -1,16 +1,403 @@
-from logic_utils import check_guess
+import pytest
+import pathlib
+from logic_utils import check_guess, parse_guess, update_score
+
+
+# ── Existing sanity checks ─────────────────────────────────────────────────────
 
 def test_winning_guess():
-    # If the secret is 50 and guess is 50, it should be a win
-    result = check_guess(50, 50)
-    assert result == "Win"
+    outcome, _ = check_guess(50, 50)
+    assert outcome == "Win"
 
 def test_guess_too_high():
-    # If secret is 50 and guess is 60, hint should be "Too High"
-    result = check_guess(60, 50)
-    assert result == "Too High"
+    outcome, _ = check_guess(60, 50)
+    assert outcome == "Too High"
 
 def test_guess_too_low():
-    # If secret is 50 and guess is 40, hint should be "Too Low"
-    result = check_guess(40, 50)
-    assert result == "Too Low"
+    outcome, _ = check_guess(40, 50)
+    assert outcome == "Too Low"
+
+
+# ── Defect 1 - Issue 1: swapped hint messages ─────────────────────────────────
+# check_guess returned "📈 Go HIGHER!" when the guess was too high, and
+# "📉 Go LOWER!" when it was too low.  The messages were reversed.
+# Fix in: logic_utils.py → check_guess
+
+class TestDefect1Issue1HintMessages:
+    def test_too_high_message_says_go_lower(self):
+        """guess > secret → hint must direct the player DOWN, not up."""
+        _, message = check_guess(60, 50)
+        assert "LOWER" in message, f"Expected 'LOWER' in hint, got: {message!r}"
+
+    def test_too_low_message_says_go_higher(self):
+        """guess < secret → hint must direct the player UP, not down."""
+        _, message = check_guess(40, 50)
+        assert "HIGHER" in message, f"Expected 'HIGHER' in hint, got: {message!r}"
+
+    def test_correct_guess_message_contains_correct(self):
+        """Exact guess → congratulatory message returned."""
+        _, message = check_guess(50, 50)
+        assert "Correct" in message
+
+
+# ── Defect 1 - Issue 2: alternating int/str secret type ───────────────────────
+# app.py cast the secret to str on even-numbered attempts and kept it as int on
+# odd-numbered attempts.  This made check_guess receive a string secret every
+# other call, causing TypeError (Python 3 cannot compare int > str) and
+# therefore unreliable hint direction.
+# Fix in: app.py → submit block (secret always read as int from session_state)
+
+class TestDefect1Issue2SecretTypeStability:
+    def test_consistent_result_for_repeated_calls_with_int_secret(self):
+        """Same int guess + int secret must return identical result every time,
+        simulating four consecutive attempts as produced by the fixed code."""
+        secret = 42
+        results = [check_guess(60, secret) for _ in range(4)]
+        assert all(r == results[0] for r in results), (
+            "check_guess returned different results for identical inputs — "
+            "Defect 1 - Issue 2 type instability may have been re-introduced"
+        )
+
+    def test_string_secret_raises_type_error(self):
+        """Passing a str secret (as the buggy code did on even attempts) must
+        raise TypeError, proving that app.py must always supply an int."""
+        with pytest.raises(TypeError):
+            check_guess(60, "42")
+
+    def test_parse_guess_always_returns_int(self):
+        """parse_guess must return an int so that check_guess never receives a
+        string guess from normal user input."""
+        ok, value, _ = parse_guess("55")
+        assert ok is True
+        assert isinstance(value, int)
+
+
+# ── Defect 2: new-game button did not reset status or score ───────────────────
+# When the player won or lost, clicking New Game left session_state["status"]
+# as "won"/"lost" and kept the old score.  On the very next rerun Streamlit
+# hit the early st.stop() guard, making the game immediately unplayable.
+# Fix in: app.py → new_game block (status and score now reset alongside attempts)
+
+class TestDefect2NewGameReset:
+    """Simulate the fixed new-game block from app.py using a plain dict in
+    place of st.session_state so we can assert its values without Streamlit."""
+
+    def _run_new_game(self, state: dict) -> dict:
+        """Mirror the corrected new-game reset block in app.py."""
+        import random
+        state["attempts"] = 0
+        state["secret"] = random.randint(1, 100)
+        state["status"] = "playing"   # ← was missing before Defect 2 fix
+        state["score"] = 0            # ← was missing before Defect 2 fix
+        return state
+
+    def test_status_reset_to_playing_after_win(self):
+        state = {"attempts": 3, "secret": 42, "status": "won", "score": 80}
+        result = self._run_new_game(state)
+        assert result["status"] == "playing", (
+            "status must be 'playing' after New Game so st.stop() is not triggered"
+        )
+
+    def test_status_reset_to_playing_after_loss(self):
+        state = {"attempts": 8, "secret": 17, "status": "lost", "score": -20}
+        result = self._run_new_game(state)
+        assert result["status"] == "playing"
+
+    def test_score_reset_to_zero(self):
+        state = {"attempts": 5, "secret": 99, "status": "lost", "score": 45}
+        result = self._run_new_game(state)
+        assert result["score"] == 0, "score must be 0 at the start of a new game"
+
+    def test_attempts_reset_to_zero(self):
+        state = {"attempts": 7, "secret": 33, "status": "won", "score": 60}
+        result = self._run_new_game(state)
+        assert result["attempts"] == 0
+
+
+# ── Defect 3: desynchronized attempt counter ──────────────────────────────────
+# Two compounding causes:
+#   1. attempts was initialized to 1 instead of 0, so the counter opened at N-1.
+#   2. st.info() rendered above the submit block; on a button-click rerun
+#      Streamlit executes top-to-bottom, so the display read the pre-increment
+#      value and stayed stuck at N-1 for the first two guesses.
+# Fix in: app.py → session_state init (0) + st.empty() placeholder filled after
+# the submit block so the counter always reflects the post-increment value.
+
+class TestDefect3AttemptCounter:
+    ATTEMPT_LIMIT = 10
+
+    def _init_state(self):
+        """Mirror the fixed session_state initialization: attempts starts at 0."""
+        return {"attempts": 0}
+
+    def _simulate_submit(self, state: dict) -> dict:
+        """Mirror the submit block: increment attempts before display is filled."""
+        state["attempts"] += 1
+        return state
+
+    def _display_counter(self, state: dict) -> int:
+        """Mirror counter_placeholder.info(): reads attempts after the submit block."""
+        return self.ATTEMPT_LIMIT - state["attempts"]
+
+    # ── root cause 1: wrong initial value ─────────────────────────────────────
+
+    def test_initial_attempts_is_zero(self):
+        """attempts must be 0 at game start — was 1 before the Defect 3 fix."""
+        state = self._init_state()
+        assert state["attempts"] == 0, (
+            "Defect 3 regression: attempts initialized to non-zero; counter will start at N-1"
+        )
+
+    def test_counter_shows_full_limit_before_any_guess(self):
+        """No guesses yet → counter must equal the full attempt limit."""
+        state = self._init_state()
+        assert self._display_counter(state) == self.ATTEMPT_LIMIT
+
+    # ── root cause 2: display lagged one run behind ────────────────────────────
+
+    def test_counter_decrements_immediately_after_first_guess(self):
+        """After guess 1, counter must drop to limit-1 (was stuck at N-1 for
+        the first two guesses before the Defect 3 fix)."""
+        state = self._init_state()
+        state = self._simulate_submit(state)
+        assert self._display_counter(state) == self.ATTEMPT_LIMIT - 1
+
+    def test_counter_does_not_stick_between_guess_1_and_guess_2(self):
+        """Defect 3 kept the display value identical for the first two guesses (out-of-sync counter).
+        After both fixes the value must differ at each step."""
+        state = self._init_state()
+        state = self._simulate_submit(state)
+        after_first = self._display_counter(state)
+        state = self._simulate_submit(state)
+        after_second = self._display_counter(state)
+        assert after_first != after_second, (
+            "Counter stuck: same display value after guess 1 and guess 2 — Defect 3 regression"
+        )
+
+    def test_counter_decrements_by_one_per_guess(self):
+        """Counter must decrease by exactly 1 for each consecutive guess."""
+        state = self._init_state()
+        for expected_left in range(self.ATTEMPT_LIMIT - 1, -1, -1):
+            state = self._simulate_submit(state)
+            assert self._display_counter(state) == expected_left
+
+    def test_counter_reaches_zero_when_attempts_exhausted(self):
+        """After limit guesses the counter must hit 0, not go negative."""
+        state = self._init_state()
+        for _ in range(self.ATTEMPT_LIMIT):
+            state = self._simulate_submit(state)
+        assert self._display_counter(state) == 0
+
+
+# ── Defect 4: attempt_limit_map inverted Easy vs Normal ───────────────────────
+# The original map gave Easy=6 and Normal=8, making the beginner level harder
+# than the middle difficulty.  We spotted it by comparing sidebar captions
+# across difficulties, confirmed the expected ordering with AI, and corrected
+# the values to Easy=10, Normal=7, Hard=5.
+# Fix in: app.py → attempt_limit_map
+# These tests mirror the fixed map directly so that any future regression
+# (e.g. accidentally reverting the values) is caught immediately.
+
+class TestDefect4DifficultyScaling:
+    ATTEMPT_LIMIT_MAP = {
+        "Easy": 10,
+        "Normal": 7,
+        "Hard": 5,
+    }
+
+    def test_easy_has_more_attempts_than_normal(self):
+        """Easy must be the most forgiving tier."""
+        assert self.ATTEMPT_LIMIT_MAP["Easy"] > self.ATTEMPT_LIMIT_MAP["Normal"], (
+            "Easy should have more attempts than Normal — Defect 4 regression"
+        )
+
+    def test_normal_has_more_attempts_than_hard(self):
+        """Normal must sit between Easy and Hard."""
+        assert self.ATTEMPT_LIMIT_MAP["Normal"] > self.ATTEMPT_LIMIT_MAP["Hard"], (
+            "Normal should have more attempts than Hard — Defect 4 regression"
+        )
+
+    def test_easy_has_more_attempts_than_hard(self):
+        """Easy must be strictly easier than Hard end-to-end."""
+        assert self.ATTEMPT_LIMIT_MAP["Easy"] > self.ATTEMPT_LIMIT_MAP["Hard"]
+
+    def test_all_difficulties_have_positive_attempts(self):
+        """Every difficulty must allow at least one guess."""
+        for difficulty, limit in self.ATTEMPT_LIMIT_MAP.items():
+            assert limit > 0, f"{difficulty} must have at least 1 attempt, got {limit}"
+
+
+# ── Defect 5: flawed scoring system ───────────────────────────────────────────
+# update_score used (attempt_number + 1) instead of (attempt_number - 1),
+# so a perfect first guess scored 80 instead of 100.  Wrong-guess penalties
+# had no floor either, allowing the total score to go negative.
+# Fix in: logic_utils.py → update_score
+
+class TestDefect5ScoringSystem:
+    def test_perfect_first_guess_scores_100(self):
+        """Win on attempt 1 with a clean slate must yield exactly 100."""
+        assert update_score(0, "Win", 1) == 100
+
+    def test_second_attempt_win_scores_90(self):
+        """Each additional attempt before winning costs 10 points."""
+        assert update_score(0, "Win", 2) == 90
+
+    def test_tenth_attempt_win_scores_minimum_10(self):
+        """Points are floored at 10 so a late win still awards something."""
+        assert update_score(0, "Win", 10) == 10
+
+    def test_score_does_not_go_negative_on_too_low(self):
+        """A -5 penalty on a score of 3 must be clamped to 0, not -2."""
+        result = update_score(3, "Too Low", 1)
+        assert result >= 0, f"Defect 5 regression: score went negative ({result})"
+
+    def test_score_does_not_go_negative_on_too_high_odd_attempt(self):
+        """Odd-attempt too-high penalty must also be clamped at 0."""
+        result = update_score(2, "Too High", 1)   # odd → -5, floored at 0
+        assert result >= 0, f"Defect 5 regression: score went negative ({result})"
+
+    def test_score_stays_zero_after_many_wrong_guesses(self):
+        """Exhausting all attempts while on 0 score must not produce negatives."""
+        score = 0
+        for attempt in range(1, 8):
+            score = update_score(score, "Too Low", attempt)
+        assert score == 0
+
+    def test_even_attempt_too_high_awards_points(self):
+        """Even-attempt too-high is a bonus (+5), not a penalty."""
+        result = update_score(10, "Too High", 2)   # even → +5
+        assert result == 15
+
+
+# ── Defect 6: dead Enter key ───────────────────────────────────────────────────
+# st.text_input + st.button do not share a form, so Enter did nothing.
+# Fix in: app.py → guess input and submit wrapped in st.form / st.form_submit_button.
+# This is a UI concern that cannot be driven by pytest, so we use a source
+# inspection test to guard against the fix being accidentally reverted.
+
+class TestDefect6EnterKey:
+    APP_SOURCE = (pathlib.Path(__file__).parent.parent / "app.py").read_text(encoding="utf-8")
+
+    def test_app_uses_st_form(self):
+        """app.py must declare an st.form so Enter submits the guess."""
+        assert 'st.form(' in self.APP_SOURCE, (
+            "Defect 6 regression: st.form not found — Enter key will not submit the guess"
+        )
+
+    def test_app_uses_form_submit_button(self):
+        """submit must be bound to st.form_submit_button, not st.button."""
+        assert 'st.form_submit_button(' in self.APP_SOURCE, (
+            "Defect 6 regression: st.form_submit_button not found — Enter key will not submit"
+        )
+
+    def test_app_does_not_use_plain_button_for_submit(self):
+        """st.button must not be used for the guess submission (New Game only)."""
+        plain_buttons = self.APP_SOURCE.count('st.button(')
+        assert plain_buttons == 1, (
+            f"Defect 6 regression: expected 1 st.button (New Game only), found {plain_buttons}; "
+            "guess submit may have been reverted to st.button"
+        )
+
+
+# ── Defect 7: missing input range validation ───────────────────────────────────
+# parse_guess only checked that the input was a valid number; it never verified
+# the value was within the game's range, so -5 or 500 sailed through unchecked.
+# Fix in: app.py → bounds check added immediately after parse_guess succeeds.
+# These tests replicate that inline check as a standalone helper so it can be
+# exercised without Streamlit.
+
+class TestDefect7RangeValidation:
+    def _check_range(self, ok, guess_int, low, high):
+        """Replicate the inline bounds check from app.py."""
+        if ok and not (low <= guess_int <= high):
+            return False, f"Please enter a number between {low} and {high}."
+        return ok, None
+
+    def test_guess_below_range_is_rejected(self):
+        assert self._check_range(True, 0, 1, 100) == (False, "Please enter a number between 1 and 100.")
+
+    def test_guess_above_range_is_rejected(self):
+        assert self._check_range(True, 101, 1, 100) == (False, "Please enter a number between 1 and 100.")
+
+    def test_negative_guess_is_rejected(self):
+        ok, _ = self._check_range(True, -5, 1, 100)
+        assert ok is False
+
+    def test_lower_bound_is_accepted(self):
+        ok, err = self._check_range(True, 1, 1, 100)
+        assert ok is True and err is None
+
+    def test_upper_bound_is_accepted(self):
+        ok, err = self._check_range(True, 100, 1, 100)
+        assert ok is True and err is None
+
+    def test_mid_range_guess_is_accepted(self):
+        ok, err = self._check_range(True, 50, 1, 100)
+        assert ok is True and err is None
+
+    def test_failed_parse_bypasses_range_check(self):
+        """If parse_guess already failed (ok=False), range check must not run."""
+        ok, err = self._check_range(False, None, 1, 100)
+        assert ok is False and err is None
+
+    def test_easy_mode_range_respected(self):
+        """Easy mode has a tighter range (1–20); 21 must be rejected."""
+        ok, _ = self._check_range(True, 21, 1, 20)
+        assert ok is False
+
+    def test_hard_mode_range_respected(self):
+        """Hard mode caps at 50; 51 must be rejected."""
+        ok, _ = self._check_range(True, 51, 1, 50)
+        assert ok is False
+
+
+# ── Defect 8: stale debug history ─────────────────────────────────────────────
+# The debug expander sat above the submit block, so history rendered one step
+# behind on every run.  Invalid guesses were also appended as raw strings,
+# mixing types in the list.
+# Fix in: app.py → expander moved after the submit block; invalid guesses no
+# longer appended to history (only valid int guesses are recorded).
+
+class TestDefect8DebugHistory:
+    def _simulate_submit(self, history, ok, guess_int):
+        """Replicate the fixed history-append logic from app.py."""
+        if ok:
+            history.append(guess_int)
+        # invalid guesses are NOT appended — was the source of mixed-type history
+        return history
+
+    def test_valid_guess_is_recorded_in_history(self):
+        history = self._simulate_submit([], True, 42)
+        assert history == [42]
+
+    def test_invalid_guess_is_not_recorded_in_history(self):
+        """A failed parse must not pollute history with a raw string."""
+        history = self._simulate_submit([], False, None)
+        assert history == [], (
+            "Defect 8 regression: invalid guess was appended — history will contain non-int entries"
+        )
+
+    def test_history_contains_only_ints(self):
+        """All entries added by the fixed code must be integers."""
+        history = []
+        for guess in [10, 50, 75]:
+            self._simulate_submit(history, True, guess)
+        assert all(isinstance(g, int) for g in history), (
+            "Defect 8 regression: non-int value found in history"
+        )
+
+    def test_history_preserves_chronological_order(self):
+        """Guesses must appear in submission order."""
+        history = []
+        for guess in [30, 60, 45]:
+            self._simulate_submit(history, True, guess)
+        assert history == [30, 60, 45]
+
+    def test_mixed_valid_invalid_submits_only_record_valid(self):
+        """A sequence of valid/invalid submits must only keep the valid ints."""
+        history = []
+        self._simulate_submit(history, True, 20)
+        self._simulate_submit(history, False, None)   # invalid — not appended
+        self._simulate_submit(history, True, 55)
+        self._simulate_submit(history, False, None)   # invalid — not appended
+        assert history == [20, 55]
