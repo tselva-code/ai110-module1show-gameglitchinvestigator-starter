@@ -1,11 +1,12 @@
 def get_range_for_difficulty(difficulty: str):
     """Return (low, high) inclusive range for a given difficulty."""
-    if difficulty == "Easy":
-        return 1, 20
-    if difficulty == "Normal":
-        return 1, 100
-    if difficulty == "Hard":
-        return 1, 50
+    # Defect 4 Fix (range): Original code returned 1–20 for Easy and 1–50 for
+    # Hard, creating a mismatch — the UI showed 1–100 but the secret was drawn
+    # from a narrower range and Defect 7's validation also blocked guesses above
+    # that narrower bound. We spotted this by switching to Easy, guessing 50,
+    # and receiving a range error even though the UI said 1–100 was valid.
+    # Discussed with AI, which confirmed difficulty should be expressed through
+    # attempt count alone. All tiers now return the same 1–100 range.
     return 1, 100
 
 

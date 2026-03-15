@@ -15,19 +15,21 @@ difficulty = st.sidebar.selectbox(
     index=1,
 )
 
-# Defect 4 Fix Start: The original map had Easy=6, Normal=8, Hard=5 —
-# Normal was more forgiving than Easy, inverting the expected difficulty curve.
-# We spotted this by switching difficulties in the sidebar and comparing the
-# displayed attempt counts. Described the inversion to AI, which confirmed the
-# expected ordering (Easy = most attempts, Hard = fewest) and suggested the
-# corrected values below so each tier is meaningfully distinct.
+# Defect 4 Fix Start: Two problems corrected here.
+# (1) Attempt counts were inverted: Easy=6, Normal=8, Hard=5 made Normal easier
+#     than Easy. Confirmed the expected ordering with AI and corrected the values.
+# (2) get_range_for_difficulty returned 1–20 for Easy and 1–50 for Hard, so the
+#     secret number and range validation were tighter on those tiers while the UI
+#     still showed "1 to 100". This caused a mismatch where a secret above 20
+#     could be generated on Easy but the player could not guess above 20.
+#     Removed per-difficulty ranges; all tiers now share 1–100 uniformly.
+#     Difficulty is expressed solely through attempt count.
 attempt_limit_map = {
     "Easy": 10,
-    "Normal": 7,
-    "Hard": 5,
+    "Normal": 8,
+    "Hard": 4,
 }
-# Defect 4 Fix End: Easy=10, Normal=7, Hard=5 — attempt counts now decrease
-# correctly as difficulty increases, verified by checking sidebar captions.
+# Defect 4 Fix End: Easy=10, Normal=8, Hard=4 over a uniform 1–100 range.
 attempt_limit = attempt_limit_map[difficulty]
 
 low, high = get_range_for_difficulty(difficulty)
@@ -110,8 +112,6 @@ if st.session_state.status != "playing":
     st.stop()
 
 if submit:
-    st.session_state.attempts += 1
-
     ok, guess_int, err = parse_guess(raw_guess)
 
     # Defect 7 Fix Start: parse_guess only checked that the input was a valid
@@ -121,6 +121,10 @@ if submit:
     # AI confirmed that parse_guess has no knowledge of the range and suggested
     # adding the bounds check here in app.py right after parsing, since low/high
     # are already in scope and parse_guess stays a general-purpose utility.
+    # Follow-up: attempts increment moved inside the valid-guess branch below
+    # so that invalid input (bad format or out-of-range) is treated as a free
+    # re-entry and does not cost the player an attempt. Discussed with AI —
+    # penalizing a typo is poor UX, especially on Hard with only 4 attempts.
     if ok and not (low <= guess_int <= high):
         ok = False
         err = f"Please enter a number between {low} and {high}."
@@ -129,6 +133,7 @@ if submit:
     if not ok:
         st.error(err)
     else:
+        st.session_state.attempts += 1
         st.session_state.history.append(guess_int)
 
         # Defect 1 - Issue 2 Fix Start: The original code cast secret to str on

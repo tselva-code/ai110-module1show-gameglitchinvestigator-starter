@@ -1,6 +1,6 @@
 import pytest
 import pathlib
-from logic_utils import check_guess, parse_guess, update_score
+from logic_utils import check_guess, parse_guess, update_score, get_range_for_difficulty
 
 
 # ── Existing sanity checks ─────────────────────────────────────────────────────
@@ -191,18 +191,19 @@ class TestDefect3AttemptCounter:
 
 # ── Defect 4: attempt_limit_map inverted Easy vs Normal ───────────────────────
 # The original map gave Easy=6 and Normal=8, making the beginner level harder
-# than the middle difficulty.  We spotted it by comparing sidebar captions
-# across difficulties, confirmed the expected ordering with AI, and corrected
-# the values to Easy=10, Normal=7, Hard=5.
-# Fix in: app.py → attempt_limit_map
+# than the middle difficulty.  Also removed per-difficulty ranges (Easy was
+# 1–20, Hard was 1–50) — all difficulties now share 1–100 so the secret number
+# and range validation are consistent across tiers.
+# Fix in: app.py → attempt_limit_map (Easy=10, Normal=8, Hard=4)
+#         logic_utils.py → get_range_for_difficulty (uniform 1–100)
 # These tests mirror the fixed map directly so that any future regression
 # (e.g. accidentally reverting the values) is caught immediately.
 
 class TestDefect4DifficultyScaling:
     ATTEMPT_LIMIT_MAP = {
         "Easy": 10,
-        "Normal": 7,
-        "Hard": 5,
+        "Normal": 8,
+        "Hard": 4,
     }
 
     def test_easy_has_more_attempts_than_normal(self):
@@ -225,6 +226,15 @@ class TestDefect4DifficultyScaling:
         """Every difficulty must allow at least one guess."""
         for difficulty, limit in self.ATTEMPT_LIMIT_MAP.items():
             assert limit > 0, f"{difficulty} must have at least 1 attempt, got {limit}"
+
+    def test_all_difficulties_return_1_to_100_range(self):
+        """All tiers must share the same 1–100 range — per-difficulty ranges
+        (Easy=1–20, Hard=1–50) were removed as part of the Defect 4 range fix."""
+        for difficulty in self.ATTEMPT_LIMIT_MAP:
+            low, high = get_range_for_difficulty(difficulty)
+            assert (low, high) == (1, 100), (
+                f"Defect 4 regression: {difficulty} returned range {low}–{high}, expected 1–100"
+            )
 
 
 # ── Defect 5: flawed scoring system ───────────────────────────────────────────
@@ -302,9 +312,11 @@ class TestDefect6EnterKey:
 # ── Defect 7: missing input range validation ───────────────────────────────────
 # parse_guess only checked that the input was a valid number; it never verified
 # the value was within the game's range, so -5 or 500 sailed through unchecked.
-# Fix in: app.py → bounds check added immediately after parse_guess succeeds.
-# These tests replicate that inline check as a standalone helper so it can be
-# exercised without Streamlit.
+# Follow-up fix: attempts increment was moved inside the valid-guess branch so
+# that invalid input (bad format or out-of-range) does not cost the player an
+# attempt — it is treated as a free re-entry instead.
+# Fix in: app.py → bounds check after parse_guess; attempts += 1 moved inside
+#         the valid-else branch.
 
 class TestDefect7RangeValidation:
     def _check_range(self, ok, guess_int, low, high):
@@ -340,15 +352,48 @@ class TestDefect7RangeValidation:
         ok, err = self._check_range(False, None, 1, 100)
         assert ok is False and err is None
 
-    def test_easy_mode_range_respected(self):
-        """Easy mode has a tighter range (1–20); 21 must be rejected."""
-        ok, _ = self._check_range(True, 21, 1, 20)
-        assert ok is False
+    def test_all_difficulty_modes_use_1_to_100_range(self):
+        """All difficulties share the 1–100 range; 100 must be accepted and
+        101 rejected regardless of which difficulty is active."""
+        ok_100, _ = self._check_range(True, 100, 1, 100)
+        assert ok_100 is True
+        ok_101, _ = self._check_range(True, 101, 1, 100)
+        assert ok_101 is False
 
-    def test_hard_mode_range_respected(self):
-        """Hard mode caps at 50; 51 must be rejected."""
-        ok, _ = self._check_range(True, 51, 1, 50)
-        assert ok is False
+    # ── follow-up: invalid input must not consume an attempt ───────────────────
+
+    def _simulate_attempt(self, attempts, ok, guess_int, low=1, high=100):
+        """Mirror the fixed submit block: increment only when input is valid."""
+        if ok and not (low <= guess_int <= high):
+            ok = False
+        if ok:
+            attempts += 1
+        return attempts
+
+    def test_valid_in_range_guess_consumes_attempt(self):
+        """A valid in-range guess must increment the attempt counter."""
+        assert self._simulate_attempt(0, True, 50) == 1
+
+    def test_out_of_range_guess_does_not_consume_attempt(self):
+        """An out-of-range number must not cost the player an attempt."""
+        assert self._simulate_attempt(0, True, 200) == 0, (
+            "Defect 7 regression: out-of-range input consumed an attempt"
+        )
+
+    def test_invalid_format_does_not_consume_attempt(self):
+        """A non-numeric input (parse failed, ok=False) must not cost an attempt."""
+        assert self._simulate_attempt(0, False, None) == 0, (
+            "Defect 7 regression: invalid format input consumed an attempt"
+        )
+
+    def test_attempts_only_increment_on_consecutive_valid_guesses(self):
+        """Mixed valid/invalid submits must only count the valid ones."""
+        attempts = 0
+        attempts = self._simulate_attempt(attempts, True, 50)   # valid   → 1
+        attempts = self._simulate_attempt(attempts, True, 999)  # invalid → 1
+        attempts = self._simulate_attempt(attempts, False, None) # bad fmt → 1
+        attempts = self._simulate_attempt(attempts, True, 75)   # valid   → 2
+        assert attempts == 2
 
 
 # ── Defect 8: stale debug history ─────────────────────────────────────────────
